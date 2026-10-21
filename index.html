@@ -15,7 +15,7 @@
   h1 em{color:var(--accent)}
   header p{color:var(--muted);margin:8px 0 0;font-size:15px}
   main{max-width:1100px;margin:0 auto;padding:0 16px 64px}
-  #drop{border:1.5px dashed #cfc7bd;border-radius:18px;background:var(--card);padding:44px 20px;text-align:center;cursor:pointer;transition:.2s}
+  #drop{display:block;border:1.5px dashed #cfc7bd;border-radius:18px;background:var(--card);padding:44px 20px;text-align:center;cursor:pointer;transition:.2s}
   #drop:hover,#drop.over{border-color:var(--accent);background:#fffaf6}
   #drop strong{display:block;font-size:17px;font-weight:500;margin-bottom:6px}
   #drop span{color:var(--muted);font-size:14px}
@@ -187,49 +187,103 @@ async function process(file, onProgress){
   return await new Promise(r => c.toBlob(r, 'image/jpeg', 1));
 }
 
-// Encaje / telas transparentes: lo que dentro de la prenda tiene el color del fondo original
-// se vuelve transparente, y se "desmezcla" el color para quitar el tinte del fondo.
+// Encaje / telas transparentes: recorte por diferencia de color contra el fondo original,
+// combinado con la máscara de la IA. Lo que se parece al fondo dentro de la prenda queda transparente.
 async function refineTransparency(file, fg){
-  const W = fg.width, H = fg.height;
-  const c = new OffscreenCanvas(W, H), x = c.getContext('2d', { willReadFrequently: true });
-  x.drawImage(fg, 0, 0);
-  const fd = x.getImageData(0, 0, W, H), p = fd.data;
+  const W = fg.width, H = fg.height, N = W * H;
   let orig = await createImageBitmap(file, { imageOrientation: 'from-image' });
-  if (orig.width !== W) { orig.close?.(); orig = await createImageBitmap(file, { imageOrientation: 'none' }); }
+  if (orig.width !== W || orig.height !== H) { orig.close?.(); orig = await createImageBitmap(file, { imageOrientation: 'none' }); }
   if (orig.width !== W || orig.height !== H) return fg;
-  x.clearRect(0, 0, W, H); x.drawImage(orig, 0, 0, W, H);
-  const o = x.getImageData(0, 0, W, H).data;
 
-  // Color de fondo = mediana de los píxeles fuera de la máscara
-  const hr = new Uint32Array(256), hg = new Uint32Array(256), hb = new Uint32Array(256);
-  let n = 0;
-  for (let i = 0; i < p.length; i += 4 * 7) if (p[i + 3] < 8) { hr[o[i]]++; hg[o[i + 1]]++; hb[o[i + 2]]++; n++; }
-  if (n < 500) return fg;
+  const c = new OffscreenCanvas(W, H), x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(orig, 0, 0); const O = x.getImageData(0, 0, W, H).data;
+  x.clearRect(0, 0, W, H); x.drawImage(fg, 0, 0); const out = x.getImageData(0, 0, W, H); const P = out.data;
+
+  // 1) Color del fondo: mediana del borde de la foto
+  const bw = Math.max(2, Math.round(Math.min(W, H) * 0.03));
+  const hr = new Uint32Array(256), hg = new Uint32Array(256), hb = new Uint32Array(256); let n = 0;
+  for (let y = 0; y < H; y += 2) for (let xx = 0; xx < W; xx += 2) {
+    if (y >= bw && y < H - bw && xx >= bw && xx < W - bw) continue;
+    const i = (y * W + xx) * 4; hr[O[i]]++; hg[O[i + 1]]++; hb[O[i + 2]]++; n++;
+  }
   const med = h => { let a = 0; for (let v = 0; v < 256; v++) { a += h[v]; if (a >= n / 2) return v; } return 0; };
   const B = [med(hr), med(hg), med(hb)];
+  const dist = (r, g, b) => Math.sqrt((r - B[0]) ** 2 + (g - B[1]) ** 2 + (b - B[2]) ** 2);
 
-  // Distancia al fondo: p85 dentro de la prenda = opaco
-  const hd = new Uint32Array(443); let m = 0;
-  for (let i = 0; i < p.length; i += 4 * 3) if (p[i + 3] > 230) {
-    hd[Math.round(Math.hypot(p[i] - B[0], p[i + 1] - B[1], p[i + 2] - B[2]))]++; m++;
+  // 2) Región de la prenda en baja resolución (Otsu + apertura + relleno de huecos)
+  const sc = Math.min(1, 800 / Math.max(W, H)), w = Math.round(W * sc), h = Math.round(H * sc), M = w * h;
+  const sc2 = new OffscreenCanvas(w, h), sx = sc2.getContext('2d', { willReadFrequently: true });
+  sx.drawImage(orig, 0, 0, w, h); const S = sx.getImageData(0, 0, w, h).data;
+  sx.clearRect(0, 0, w, h); sx.drawImage(fg, 0, 0, w, h); const SM = sx.getImageData(0, 0, w, h).data;
+  const ds = new Float32Array(M), hist = new Float64Array(443);
+  for (let j = 0; j < M; j++) { const d = dist(S[j * 4], S[j * 4 + 1], S[j * 4 + 2]); ds[j] = d; hist[Math.min(442, d | 0)]++; }
+  let sum = 0; for (let t = 0; t < 443; t++) sum += t * hist[t];
+  let wB = 0, sB = 0, best = 0, T = 0;
+  for (let t = 0; t < 443; t++) {
+    wB += hist[t]; if (!wB) continue; const wF = M - wB; if (!wF) break;
+    sB += t * hist[t]; const v = wB * wF * (sB / wB - (sum - sB) / wF) ** 2; if (v > best) { best = v; T = t; }
   }
-  if (m < 500) return fg;
-  let acc = 0, t1 = 442;
-  for (let v = 0; v < 443; v++) { acc += hd[v]; if (acc >= m * 0.85) { t1 = v; break; } }
-  if (t1 < 60) return fg; // prenda muy parecida al fondo: no tocar
-  const t0 = t1 * 0.15;
+  let bin = new Uint8Array(M);
+  for (let j = 0; j < M; j++) bin[j] = (ds[j] > T || SM[j * 4 + 3] > 200) ? 1 : 0;
+  const morph = (src, r, dilate) => { // min/max separable en cuadrado
+    const tmp = new Uint8Array(M), dst = new Uint8Array(M);
+    for (let y = 0; y < h; y++) for (let xx = 0; xx < w; xx++) {
+      let v = dilate ? 0 : 1;
+      for (let k = Math.max(0, xx - r); k <= Math.min(w - 1, xx + r); k++) { const s = src[y * w + k]; if (dilate ? s : !s) { v = dilate ? 1 : 0; break; } }
+      tmp[y * w + xx] = v;
+    }
+    for (let y = 0; y < h; y++) for (let xx = 0; xx < w; xx++) {
+      let v = dilate ? 0 : 1;
+      for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) { const s = tmp[k * w + xx]; if (dilate ? s : !s) { v = dilate ? 1 : 0; break; } }
+      dst[y * w + xx] = v;
+    }
+    return dst;
+  };
+  bin = morph(morph(bin, 2, false), 2, true);
+  // flood fill del fondo desde los bordes: lo no alcanzado es la prenda (con huecos rellenos)
+  const bgc = new Uint8Array(M), q = new Int32Array(M); let qh = 0, qt = 0;
+  const push = j => { if (!bin[j] && !bgc[j]) { bgc[j] = 1; q[qt++] = j; } };
+  for (let xx = 0; xx < w; xx++) { push(xx); push((h - 1) * w + xx); }
+  for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+  while (qh < qt) {
+    const j = q[qh++], xx = j % w;
+    if (xx > 0) push(j - 1); if (xx < w - 1) push(j + 1); if (j >= w) push(j - w); if (j < M - w) push(j + w);
+  }
+  let region = new Uint8Array(M); for (let j = 0; j < M; j++) region[j] = bgc[j] ? 0 : 1;
+  region = morph(region, 3, true);
 
-  for (let i = 0; i < p.length; i += 4) {
-    const a = p[i + 3]; if (!a) continue;
-    const r = p[i], g = p[i + 1], b = p[i + 2];
-    const k = Math.min(1, Math.max(0, (Math.hypot(r - B[0], g - B[1], b - B[2]) - t0) / (t1 - t0)));
-    if (k >= 1) continue;
-    const na = a / 255 * k;
-    if (na < 0.004) { p[i + 3] = 0; continue; }
-    p[i] = B[0] + (r - B[0]) / k; p[i + 1] = B[1] + (g - B[1]) / k; p[i + 2] = B[2] + (b - B[2]) / k;
-    p[i + 3] = na * 255;
+  // 3) Escalar la región a tamaño completo (suavizada)
+  const gi = sx.createImageData(w, h);
+  for (let j = 0; j < M; j++) { gi.data[j * 4 + 3] = region[j] * 255; }
+  sx.clearRect(0, 0, w, h); sx.putImageData(gi, 0, 0);
+  x.clearRect(0, 0, W, H); x.imageSmoothingQuality = 'high'; x.drawImage(sc2, 0, 0, W, H);
+  const G = x.getImageData(0, 0, W, H).data;
+
+  // 4) Umbrales de opacidad
+  const hIn = new Uint32Array(443), hOut = new Uint32Array(443); let nIn = 0, nOut = 0;
+  for (let i = 0; i < N * 4; i += 4 * 5) {
+    const d = Math.min(442, dist(O[i], O[i + 1], O[i + 2]) | 0);
+    if (G[i + 3] > 250) { hIn[d]++; nIn++; } else if (G[i + 3] === 0) { hOut[d]++; nOut++; }
   }
-  x.putImageData(fd, 0, 0);
+  const pct = (hh, tot, p) => { let a = 0; for (let v = 0; v < 443; v++) { a += hh[v]; if (a >= tot * p) return v; } return 442; };
+  if (nIn < 200) return fg;
+  let t1 = pct(hIn, nIn, 0.97);
+  const t0 = Math.max(t1 * 0.15, nOut ? pct(hOut, nOut, 0.97) : 0);
+  t1 = Math.max(t1, t0 + 30);
+
+  // 5) Alfa final y "desmezcla" del color del fondo
+  for (let i = 0; i < N * 4; i += 4) {
+    const g = G[i + 3] / 255;
+    if (!g) { P[i + 3] = 0; continue; }
+    const r = O[i], gg = O[i + 1], b = O[i + 2];
+    const ca = Math.min(1, Math.max(0, (dist(r, gg, b) - t0) / (t1 - t0)));
+    const ma = P[i + 3] / 255;
+    if (ca >= ma && ca > 0.004) {
+      P[i] = B[0] + (r - B[0]) / ca; P[i + 1] = B[1] + (gg - B[1]) / ca; P[i + 2] = B[2] + (b - B[2]) / ca;
+    } else { P[i] = r; P[i + 1] = gg; P[i + 2] = b; }
+    P[i + 3] = 255 * g * Math.max(ca, ma);
+  }
+  x.clearRect(0, 0, W, H); x.putImageData(out, 0, 0);
   orig.close?.(); fg.close?.();
   return c.transferToImageBitmap();
 }
